@@ -109,6 +109,10 @@ class Terminal:
     RESET = "\033[0m"
     CYAN = "\033[36m"
     GREEN = "\033[32m"
+    BRIGHT_GREEN = "\033[92m"
+    MAGENTA = "\033[95m"
+    GRAY = "\033[90m"
+    BLUE = "\033[34m"
     YELLOW = "\033[33m"
     RED = "\033[31m"
     DIM = "\033[2m"
@@ -237,6 +241,34 @@ def human_size(size_mb):
     return "{:.1f} MB".format(size_mb)
 
 
+def progress_bar(
+    terminal: Terminal,
+    ratio: float,
+    width: int,
+    is_finished: bool = False,
+) -> str:
+    """Build the colored bar shared by download and installation progress.
+
+    While work is in progress, completed cells and the ``╺`` boundary are
+    magenta and all remaining cells are gray rather than blank. A finished
+    download replaces those segments with one solid bright-green bar.
+    """
+    ratio = max(0.0, min(ratio, 1.0))
+    if is_finished:
+        return terminal.paint("━" * width, terminal.BRIGHT_GREEN)
+
+    completed = min(int(width * ratio), width)
+    if completed >= width:
+        return terminal.paint("━" * width, terminal.MAGENTA)
+
+    active = "━" * completed + "╺"
+    remaining = "━" * (width - completed - 1)
+    return (
+        terminal.paint(active, terminal.MAGENTA)
+        + terminal.paint(remaining, terminal.GRAY)
+    )
+
+
 def animate_task(
     terminal: Terminal,
     label: str,
@@ -245,9 +277,9 @@ def animate_task(
 ) -> None:
     """Render a spinner-style task that finishes after a random duration.
 
-    Interactive terminals receive an in-place spinner followed by a permanent
-    completion line. Redirected output skips animation and emits only the final
-    line, keeping captured logs compact.
+    Interactive terminals receive an in-place, white spinner in the same
+    trailing position later occupied by ``done``. Redirected output skips
+    animation and emits only the final line, keeping captured logs compact.
     """
     duration = random.uniform(minimum, maximum)
     if not terminal.interactive:
@@ -259,8 +291,8 @@ def animate_task(
     started = time.monotonic()
     frame = 0
     while time.monotonic() - started < duration:
-        marker = terminal.paint(frames[frame % len(frames)], terminal.CYAN)
-        terminal.status("{} {} ...".format(marker, label))
+        marker = frames[frame % len(frames)]
+        terminal.status("{} ... {}".format(label, marker))
         frame += 1
         time.sleep(0.09)
     terminal.status("{} ... done".format(label))
@@ -276,39 +308,50 @@ def animate_download(
 ) -> None:
     """Render a timed download with pip-style size, speed, and ETA fields.
 
-    Small files use kilobytes and larger files use megabytes. Progress updates
-    overwrite one terminal line when interactive; redirected output receives
-    only the completed progress line. No network request is made.
+    Small files use kilobytes and larger files use megabytes. During a download,
+    the amount is green, speed is red, and remaining time is blue. On completion,
+    the bar turns bright green, ``eta`` becomes an empty field, and elapsed time
+    becomes yellow. Redirected output receives only the completed line.
     """
     terminal.line("  Downloading {} ({})".format(filename, human_size(size_mb)))
     duration = random.uniform(0.65, 1.65) + min(size_mb / 35.0, 0.8)
     started = time.monotonic()
-    width = 30 if pip_version >= 22 else 24
+    width = 40 if pip_version >= 26 else 30
 
     while True:
         elapsed = time.monotonic() - started
         ratio = min(elapsed / duration, 1.0)
-        completed = int(width * ratio)
-        bar = "━" * completed + " " * (width - completed)
         if size_mb < 1.0:
             total = size_mb * 1024
             downloaded = total * ratio
             speed = total / max(duration, 0.1)
-            amount = "{:>5.1f}/{:.1f} kB {:>5.1f} kB/s".format(
-                downloaded, total, speed
-            )
+            amount = "{:>5.1f}/{:.1f} kB".format(downloaded, total)
+            rate = "{:>5.1f} kB/s".format(speed)
         else:
             downloaded = size_mb * ratio
             speed = size_mb / max(duration, 0.1)
-            amount = "{:>5.1f}/{:.1f} MB {:>5.1f} MB/s".format(
-                downloaded, size_mb, speed
-            )
-        eta = max(0, int(duration - elapsed + 0.99))
-        progress = "     {} {} eta 0:00:{:02d}".format(
-            terminal.paint(bar, terminal.CYAN), amount, eta
+            amount = "{:>5.1f}/{:.1f} MB".format(downloaded, size_mb)
+            rate = "{:>5.1f} MB/s".format(speed)
+
+        is_finished = ratio >= 1.0
+        if is_finished:
+            eta_label = ""
+            seconds = max(0, int(elapsed + 0.5))
+            clock = terminal.paint("0:00:{:02d}".format(seconds), terminal.YELLOW)
+        else:
+            eta_label = "eta"
+            seconds = max(0, int(duration - elapsed + 0.99))
+            clock = terminal.paint("0:00:{:02d}".format(seconds), terminal.BLUE)
+
+        progress = "   {} {} {} {} {}".format(
+            progress_bar(terminal, ratio, width, is_finished),
+            terminal.paint(amount, terminal.GREEN),
+            terminal.paint(rate, terminal.RED),
+            eta_label,
+            clock,
         )
         terminal.status(progress)
-        if ratio >= 1.0:
+        if is_finished:
             break
         time.sleep(0.08)
 
@@ -465,9 +508,10 @@ def install_batch(
     """Render installation of one resolved package batch without completing it.
 
     Package names are displayed in reverse collection order to resemble pip's
-    dependency installation sequence. Pip 25 and newer styles also receive an
-    in-place package counter; older styles use a simple delay. No success line
-    is printed, allowing the next batch to continue the simulation naturally.
+    dependency installation sequence. Pip 25 and newer styles receive an
+    in-place magenta progress bar, a green package counter, and the active
+    package name in brackets. The completed status line is removed rather than
+    retained, and no success line is printed before the next batch begins.
     """
     names = [package.name for package in reversed(packages)]
     terminal.line("Installing collected packages: {}".format(", ".join(names)))
@@ -476,12 +520,16 @@ def install_batch(
     if pip_version >= 25:
         duration = random.uniform(1.2, 2.6)
         started = time.monotonic()
+        width = 40 if pip_version >= 26 else 30
         while time.monotonic() - started < duration:
             ratio = min((time.monotonic() - started) / duration, 1.0)
             count = min(len(names), int(ratio * len(names)) + 1)
             terminal.status(
-                terminal.paint("Installing", terminal.GREEN)
-                + " {} of {} packages".format(count, len(names))
+                "{} {} [{}]".format(
+                    progress_bar(terminal, count / len(names), width),
+                    terminal.paint("{}/{}".format(count, len(names)), terminal.GREEN),
+                    names[count - 1],
+                )
             )
             time.sleep(0.10)
         terminal.clear_status()

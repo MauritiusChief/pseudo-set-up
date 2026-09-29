@@ -41,15 +41,14 @@ PYTHON_TO_PIP = {
     "3.14": (26, 0, 1),
 }
 
-# Compatibility is validated by pip's major release; the full version tuple is
-# retained for console features introduced in minor releases such as pip 25.1.
+# Each value is a half-open interval: [minimum pip, maximum pip).
 COMPATIBLE_PIP = {
-    "3.9": range(22, 27),
-    "3.10": range(22, 27),
-    "3.11": range(22, 27),
-    "3.12": range(23, 27),
-    "3.13": range(24, 27),
-    "3.14": range(25, 27),
+    "3.9": ((22, 0, 0), (26, 1, 0)),
+    "3.10": ((22, 0, 0), (27, 0, 0)),
+    "3.11": ((22, 0, 0), (27, 0, 0)),
+    "3.12": ((23, 0, 0), (27, 0, 0)),
+    "3.13": ((24, 0, 0), (27, 0, 0)),
+    "3.14": ((25, 2, 0), (27, 0, 0)),
 }
 
 PREFIXES = [
@@ -71,6 +70,7 @@ SUFFIXES = [
 MIN_SPEED_MB_S = 0.2
 MAX_SPEED_MB_S = 4.0
 PROGRESS_REFRESH_SECONDS = 0.2
+LEGACY_PROGRESS_REFRESH_SECONDS = 1 / 30
 
 
 @dataclass(frozen=True)
@@ -226,7 +226,7 @@ def parse_args() -> argparse.Namespace:
     - ``--python`` overrides the running interpreter for all generated tags and
     paths. 
     - ``--pip`` has higher priority than the Python-to-pip default mapping,
-    but the final pair must still appear in ``COMPATIBLE_PIP``.
+    but the final pair must still satisfy the compatibility.
     """
     detected = "{}.{}".format(sys.version_info.major, sys.version_info.minor)
     parser = argparse.ArgumentParser(
@@ -256,7 +256,8 @@ def parse_args() -> argparse.Namespace:
         )
 
     args.pip_version = args.pip_version or PYTHON_TO_PIP[args.python_version]
-    if args.pip_version[0] not in COMPATIBLE_PIP[args.python_version]:
+    minimum_pip, maximum_pip = COMPATIBLE_PIP[args.python_version]
+    if not minimum_pip <= args.pip_version < maximum_pip:
         parser.error(
             "pip {} is not compatible with simulated Python {}".format(
                 ".".join(str(part) for part in args.pip_version), args.python_version
@@ -393,8 +394,13 @@ def animate_download(
     line. Larger downloads retain the colored completed state in captured output.
     """
     terminal.line("  Downloading {} ({})".format(filename, human_size(size_mb)))
+    refresh_seconds = (
+        PROGRESS_REFRESH_SECONDS
+        if pip_version >= (24, 2, 0)
+        else LEGACY_PROGRESS_REFRESH_SECONDS
+    )
     estimated_duration = size_mb / max(network.speed_mb_s, MIN_SPEED_MB_S)
-    if estimated_duration < PROGRESS_REFRESH_SECONDS:
+    if estimated_duration < refresh_seconds:
         time.sleep(estimated_duration)
         network.update()
         return
@@ -402,7 +408,7 @@ def animate_download(
     started = time.monotonic()
     previous = started
     downloaded_mb = 0.0
-    width = 40 if pip_version >= (26, 0, 0) else 30
+    width = 40
 
     while True:
         now = time.monotonic()
@@ -432,9 +438,12 @@ def animate_download(
 
         is_finished = ratio >= 1.0
         # Determin ETA style
-        if is_finished:
+        if is_finished and pip_version >= (25, 2, 0):
             eta_label = ""
             clock = terminal.paint(clock_text(elapsed), terminal.YELLOW)
+        elif is_finished:
+            eta_label = "eta"
+            clock = terminal.paint("0:00:00", terminal.CYAN)
         else:
             eta_label = "eta"
             remaining_seconds = (size_mb - downloaded_mb) / speed_mb_s
@@ -450,7 +459,7 @@ def animate_download(
         terminal.status(progress)
         if is_finished:
             break
-        time.sleep(PROGRESS_REFRESH_SECONDS)
+        time.sleep(refresh_seconds)
 
     # A redirected stream gets one completed progress line instead of frames.
     terminal.line(progress)
@@ -474,25 +483,26 @@ def maybe_retry(terminal: Terminal, package: Package) -> None:
     time.sleep(random.uniform(0.5, 1.1))
 
 
-def dependency_order(root_name: str) -> list[str]:
-    """Return a randomized depth-first package order starting at ``root_name``.
+def dependency_order(root_name: str) -> list[tuple[str, tuple[str, ...]]]:
+    """Return package names and their dependency paths from ``root_name``.
 
     Each package is included once, before its recursively visited dependencies.
     Dependency lists are shuffled so repeated batches remain visually varied,
     while the visited set prevents duplicate entries in shared dependency trees.
+    Each path starts with the direct parent and ends with the root package.
     """
     order = []
     visited = set()
 
-    def visit(name):
+    def visit(name, required_by=()):
         if name in visited:
             return
         visited.add(name)
-        order.append(name)
+        order.append((name, required_by))
         dependencies = list(PACKAGES[name].dependencies)
         random.shuffle(dependencies)
         for dependency in dependencies:
-            visit(dependency)
+            visit(dependency, (name,) + required_by)
 
     visit(root_name)
     return order
@@ -557,12 +567,16 @@ def generate_virtual_packages(
     return packages
 
 
-def maybe_backtrack(terminal: Terminal, package: Package) -> None:
+def maybe_backtrack(
+    terminal: Terminal,
+    package: Package,
+    pip_version: tuple[int, int, int],
+) -> None:
     """Occasionally render a harmless dependency-resolution backtrack.
 
     The output announces that pip is comparing versions, waits briefly, and
-    prints metadata for a fabricated older release. It does not alter the
-    package selected for the later download or installation stages.
+    prints metadata for a fabricated older release when the selected pip version
+    supports PEP 658. It does not alter the package selected for later stages.
     """
     if random.random() >= 0.12:
         return
@@ -572,14 +586,16 @@ def maybe_backtrack(terminal: Terminal, package: Package) -> None:
     )
     time.sleep(random.uniform(0.6, 1.3))
     older = package.version.rsplit(".", 1)[0] + "." + str(random.randint(0, 8))
-    terminal.line("  Downloading {}-py3-none-any.whl.metadata (6.8 kB)".format(
-        distribution_name(Package(package.name, older, 0, ())) + "-" + older
-    ))
+    if pip_version >= (22, 3, 0):
+        terminal.line("  Downloading {}-py3-none-any.whl.metadata (6.8 kB)".format(
+            distribution_name(Package(package.name, older, 0, ())) + "-" + older
+        ))
 
 
 def collect_package(
     terminal: Terminal,
     package: Package,
+    required_by: tuple[str, ...],
     python_version: str,
     pip_version: tuple[int, int, int],
     built: list[Package],
@@ -588,26 +604,39 @@ def collect_package(
     """Render collection and track packages that need wheel builds.
 
     The function may show:
+    - the dependency source added by pip 23.1
     - resolver backtracking
     - a network retry
     - a cache hit
     - or a normal wheel download
 
-    Native packages sometimes take the slower source-distribution path; those packages are appended to ``built`` so the
-    later build stage can render their wheel creation. 
-    ``network`` is shared by real and fictional packages, so each non-cached download inherits the speed
-    reached by the previous one.
+    Native packages sometimes take the slower source-distribution path; those
+    packages are appended to ``built`` so the later build stage can render their
+    wheel creation. ``network`` is shared by real and fictional packages, so
+    each non-cached download inherits the speed reached by the previous one.
     """
-    terminal.line("Collecting {}".format(package.name))
-    maybe_backtrack(terminal, package)
+    source = ""
+    if pip_version >= (23, 1, 0) and required_by:
+        source = " (from {})".format("->".join(required_by))
+    terminal.line("Collecting {}{}".format(package.name, source))
+    maybe_backtrack(terminal, package, pip_version)
     maybe_retry(terminal, package)
 
     # Native projects occasionally take the slower source-distribution route.
     is_source = package.native and random.random() < 0.22
     filename = filename_for(package, python_version, is_source)
     size = package.size_mb * (0.45 if is_source else 1.0)
+    is_cached = random.random() < 0.18 and not is_source
 
-    if random.random() < 0.18 and not is_source:
+    if not is_source and pip_version >= (22, 3, 0) and random.random() < 0.38:
+        metadata = filename + ".metadata"
+        if is_cached:
+            terminal.line("  Using cached {} ({})".format(metadata, human_size(0.01)))
+        else:
+            terminal.line("  Downloading {} ({})".format(metadata, human_size(0.01)))
+        time.sleep(random.uniform(0.12, 0.32))
+
+    if is_cached:
         terminal.line("  Using cached {} ({})".format(filename, human_size(size)))
         time.sleep(random.uniform(0.12, 0.35))
     else:
@@ -618,10 +647,6 @@ def collect_package(
         animate_task(terminal, "Getting requirements to build wheel", 0.45, 1.0)
         animate_task(terminal, "Preparing metadata (pyproject.toml)", 0.5, 1.2)
         built.append(package)
-    elif pip_version >= (23, 0, 0) and random.random() < 0.38:
-        metadata = filename + ".metadata"
-        terminal.line("  Downloading {} ({})".format(metadata, human_size(0.01)))
-        time.sleep(random.uniform(0.12, 0.32))
 
 
 def build_wheels(
@@ -679,7 +704,7 @@ def install_batch(
     if pip_version >= (25, 1, 0):
         duration = random.uniform(1.2, 2.6)
         started = time.monotonic()
-        width = 40 if pip_version >= (26, 0, 0) else 30
+        width = 40
         while time.monotonic() - started < duration:
             ratio = min((time.monotonic() - started) / duration, 1.0)
             count = min(len(names), int(ratio * len(names)) + 1)
@@ -720,35 +745,45 @@ def run_forever(args: argparse.Namespace, terminal: Terminal) -> NoReturn:
             random.shuffle(roots)
 
         root = roots.pop()
-        names = dependency_order(root)
+        requirements = dependency_order(root)
+        known_names = {name for name, _ in requirements}
         # Add an unrelated requirement occasionally, as large requirements files do.
         if random.random() < 0.45:
             extra = random.choice(ROOT_PACKAGES)
-            for name in dependency_order(extra):
-                if name not in names:
-                    names.append(name)
+            for name, required_by in dependency_order(extra):
+                if name not in known_names:
+                    requirements.append((name, required_by))
+                    known_names.add(name)
 
         # Holds the packages that assigned as need-to-build
         built = []
-        packages = [PACKAGES[name] for name in names]
+        package_entries = [
+            (PACKAGES[name], required_by)
+            for name, required_by in requirements
+        ]
         virtual_packages = generate_virtual_packages(
             random.randint(1, 4),
             virtual_catalog,
-            names,
+            list(known_names),
         )
         # Scatter fictional packages through real collection output.
         for package in virtual_packages:
-            packages.insert(random.randint(0, len(packages)), package)
+            package_entries.insert(
+                random.randint(0, len(package_entries)),
+                (package, ()),
+            )
 
-        for package in packages:
+        for package, required_by in package_entries:
             collect_package(
                 terminal,
                 package,
+                required_by,
                 args.python_version,
                 args.pip_version,
                 built,
                 network,
             )
+        packages = [package for package, _ in package_entries]
         # Simulate the build process
         build_wheels(terminal, built, args.python_version)
         # Simulate the install process

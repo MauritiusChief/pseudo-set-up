@@ -15,5 +15,6 @@ Override the detected environment only when needed:
 
 ```powershell
 python .\install.py --python 3.12
-python .\install.py --python 3.12 --pip 26
+python .\install.py --python 3.12 --pip 25.1
+python .\install.py --python 3.14 --pip 26.0.1
 ```

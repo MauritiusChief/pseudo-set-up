@@ -33,16 +33,16 @@ from typing import NoReturn
 
 
 PYTHON_TO_PIP = {
-    "3.9": 22,
-    "3.10": 23,
-    "3.11": 24,
-    "3.12": 25,
-    "3.13": 26,
-    "3.14": 26,
+    "3.9": (22, 3, 1),
+    "3.10": (23, 3, 2),
+    "3.11": (24, 3, 1),
+    "3.12": (25, 0, 1),
+    "3.13": (26, 0, 1),
+    "3.14": (26, 0, 1),
 }
 
-# These ranges keep manually selected combinations plausible. Pip 26 means
-# 26.0.x under Python 3.9, since later 26.x releases dropped Python 3.9.
+# Compatibility is validated by pip's major release; the full version tuple is
+# retained for console features introduced in minor releases such as pip 25.1.
 COMPATIBLE_PIP = {
     "3.9": range(22, 27),
     "3.10": range(22, 27),
@@ -208,6 +208,18 @@ class Terminal:
             self._status_visible = False
 
 
+def parse_pip_version(value: str) -> tuple[int, int, int]:
+    """Convert a CLI pip version into a comparable three-part tuple."""
+    parts = value.split(".")
+    if not 1 <= len(parts) <= 3 or any(not part.isdigit() for part in parts):
+        raise argparse.ArgumentTypeError(
+            "pip version must contain one to three numeric parts, such as 25.1"
+        )
+
+    version = tuple(int(part) for part in parts)
+    return (version + (0, 0))[:3]
+
+
 def parse_args() -> argparse.Namespace:
     """Resolve and validate the simulated Python and pip versions.
 
@@ -229,9 +241,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pip",
         dest="pip_version",
-        type=int,
-        choices=range(22, 27),
-        metavar="{22,23,24,25,26}",
+        type=parse_pip_version,
+        metavar="VERSION",
         help="override the pip console style inferred from Python",
     )
     args = parser.parse_args()
@@ -245,10 +256,10 @@ def parse_args() -> argparse.Namespace:
         )
 
     args.pip_version = args.pip_version or PYTHON_TO_PIP[args.python_version]
-    if args.pip_version not in COMPATIBLE_PIP[args.python_version]:
+    if args.pip_version[0] not in COMPATIBLE_PIP[args.python_version]:
         parser.error(
             "pip {} is not compatible with simulated Python {}".format(
-                args.pip_version, args.python_version
+                ".".join(str(part) for part in args.pip_version), args.python_version
             )
         )
     return args
@@ -371,7 +382,7 @@ def animate_download(
     terminal: Terminal,
     filename: str,
     size_mb: float,
-    pip_version: int,
+    pip_version: tuple[int, int, int],
     network: NetworkState,
 ) -> None:
     """Render a download driven by the process-wide network speed.
@@ -391,7 +402,7 @@ def animate_download(
     started = time.monotonic()
     previous = started
     downloaded_mb = 0.0
-    width = 40 if pip_version >= 26 else 30
+    width = 40 if pip_version >= (26, 0, 0) else 30
 
     while True:
         now = time.monotonic()
@@ -570,7 +581,7 @@ def collect_package(
     terminal: Terminal,
     package: Package,
     python_version: str,
-    pip_version: int,
+    pip_version: tuple[int, int, int],
     built: list[Package],
     network: NetworkState,
 ) -> None:
@@ -607,7 +618,7 @@ def collect_package(
         animate_task(terminal, "Getting requirements to build wheel", 0.45, 1.0)
         animate_task(terminal, "Preparing metadata (pyproject.toml)", 0.5, 1.2)
         built.append(package)
-    elif pip_version >= 23 and random.random() < 0.38:
+    elif pip_version >= (23, 0, 0) and random.random() < 0.38:
         metadata = filename + ".metadata"
         terminal.line("  Downloading {} ({})".format(metadata, human_size(0.01)))
         time.sleep(random.uniform(0.12, 0.32))
@@ -651,12 +662,12 @@ def build_wheels(
 def install_batch(
     terminal: Terminal,
     packages: list[Package],
-    pip_version: int,
+    pip_version: tuple[int, int, int],
 ) -> None:
     """Render installation of one resolved package batch without completing it.
 
     Package names are displayed in reverse collection order to resemble pip's
-    dependency installation sequence. Pip 25 and newer styles receive an
+    dependency installation sequence. Pip 25.1 and newer styles receive an
     in-place magenta progress bar, a green package counter, and the active
     package name in brackets. The completed status line is removed rather than
     retained, and no success line is printed before the next batch begins.
@@ -665,10 +676,10 @@ def install_batch(
     terminal.line("Installing collected packages: {}".format(", ".join(names)))
 
     # pip 25.1 introduced a transient installation progress display.
-    if pip_version >= 25:
+    if pip_version >= (25, 1, 0):
         duration = random.uniform(1.2, 2.6)
         started = time.monotonic()
-        width = 40 if pip_version >= 26 else 30
+        width = 40 if pip_version >= (26, 0, 0) else 30
         while time.monotonic() - started < duration:
             ratio = min((time.monotonic() - started) / duration, 1.0)
             count = min(len(names), int(ratio * len(names)) + 1)

@@ -439,7 +439,7 @@ def animate_download(
         terminal.status(progress)
         if is_finished:
             break
-        time.sleep(0.08)
+        time.sleep(PROGRESS_REFRESH_SECONDS)
 
     # A redirected stream gets one completed progress line instead of frames.
     terminal.line(progress)

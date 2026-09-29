@@ -109,10 +109,9 @@ class Terminal:
     RESET = "\033[0m"
     CYAN = "\033[36m"
     GREEN = "\033[32m"
-    BRIGHT_GREEN = "\033[92m"
-    MAGENTA = "\033[95m"
-    GRAY = "\033[90m"
-    BLUE = "\033[34m"
+    BAR_COMPLETE = "\033[38;2;249;38;114m"
+    BAR_FINISHED = "\033[38;2;114;156;31m"
+    BAR_BACK = "\033[38;5;237m"
     YELLOW = "\033[33m"
     RED = "\033[31m"
     DIM = "\033[2m"
@@ -249,24 +248,33 @@ def progress_bar(
 ) -> str:
     """Build the colored bar shared by download and installation progress.
 
-    While work is in progress, completed cells and the ``╺`` boundary are
-    magenta and all remaining cells are gray rather than blank. A finished
-    download replaces those segments with one solid bright-green bar.
+    This follows Rich's progress-bar cell algorithm and exact default colors.
+    Complete cells are pink ``━`` characters, a half cell is a pink ``╸``, and
+    ``╺`` belongs to the gray unfinished region. A finished download replaces
+    all segments with one solid yellow-green bar.
     """
     ratio = max(0.0, min(ratio, 1.0))
     if is_finished:
-        return terminal.paint("━" * width, terminal.BRIGHT_GREEN)
+        return terminal.paint("━" * width, terminal.BAR_FINISHED)
 
-    completed = min(int(width * ratio), width)
-    if completed >= width:
-        return terminal.paint("━" * width, terminal.MAGENTA)
+    complete_halves = int(width * 2 * ratio)
+    complete_bars = complete_halves // 2
+    has_half_bar = complete_halves % 2
+    parts = []
 
-    active = "━" * completed + "╺"
-    remaining = "━" * (width - completed - 1)
-    return (
-        terminal.paint(active, terminal.MAGENTA)
-        + terminal.paint(remaining, terminal.GRAY)
-    )
+    if complete_bars:
+        parts.append(terminal.paint("━" * complete_bars, terminal.BAR_COMPLETE))
+    if has_half_bar:
+        parts.append(terminal.paint("╸", terminal.BAR_COMPLETE))
+
+    remaining = width - complete_bars - has_half_bar
+    if remaining and not has_half_bar and complete_bars:
+        parts.append(terminal.paint("╺", terminal.BAR_BACK))
+        remaining -= 1
+    if remaining:
+        parts.append(terminal.paint("━" * remaining, terminal.BAR_BACK))
+
+    return "".join(parts)
 
 
 def animate_task(
@@ -341,7 +349,7 @@ def animate_download(
         else:
             eta_label = "eta"
             seconds = max(0, int(duration - elapsed + 0.99))
-            clock = terminal.paint("0:00:{:02d}".format(seconds), terminal.BLUE)
+            clock = terminal.paint("0:00:{:02d}".format(seconds), terminal.CYAN)
 
         progress = "   {} {} {} {} {}".format(
             progress_bar(terminal, ratio, width, is_finished),

@@ -6,6 +6,7 @@ Call structure:
     |-- Terminal
     `-- run_forever
         |-- dependency_order
+        |-- generate_virtual_packages
         |-- collect_package
         |   |-- maybe_backtrack
         |   |-- maybe_retry
@@ -51,6 +52,26 @@ COMPATIBLE_PIP = {
     "3.14": range(25, 27),
 }
 
+PREFIXES = [
+    "py", "fast", "async", "super", "micro", "hyper", "neo", "data",
+    "cloud", "web", "auto", "smart", "open", "simple", "tiny", "mega",
+]
+
+BODYS = [
+    "core", "utils", "client", "server", "parser", "engine", "kit",
+    "tools", "lib", "api", "stream", "cache", "model", "runtime",
+    "bridge", "flow", "stack", "worker", "codec", "store",
+]
+
+SUFFIXES = [
+    "", "-ng", "-plus", "-ext", "-pro", "-cli", "-sdk", "-py",
+    "-common", "-helper", "-extra",
+]
+
+MIN_SPEED_MB_S = 0.2
+MAX_SPEED_MB_S = 4.0
+PROGRESS_REFRESH_SECONDS = 0.2
+
 
 @dataclass(frozen=True)
 class Package:
@@ -60,6 +81,33 @@ class Package:
     size_mb: float
     dependencies: tuple
     native: bool = False
+
+
+@dataclass
+class NetworkState:
+    """Hold the download speed shared by every package in the process."""
+    # Currently displayed and applied transfer rate
+    speed_mb_s: float
+    # The slowly moving destination
+    target_mb_s: float
+
+    def update(self) -> float:
+        """Advance the global speed by one animation frame and return it.
+
+        A target change represents network conditions shifting between downloads
+        or during a large file. Both values remain inside the configured slow
+        network range so ETA and transferred-byte calculations stay plausible.
+        """
+        if random.random() < 0.03:
+            self.target_mb_s = random.uniform(MIN_SPEED_MB_S, MAX_SPEED_MB_S)
+
+        drift = (self.target_mb_s - self.speed_mb_s) * 0.08
+        jitter = random.uniform(-0.06, 0.06)
+        self.speed_mb_s = max(
+            MIN_SPEED_MB_S,
+            min(self.speed_mb_s + drift + jitter, MAX_SPEED_MB_S),
+        )
+        return self.speed_mb_s
 
 
 # A fixed catalog produces recognizable dependency chains while selection,
@@ -240,6 +288,17 @@ def human_size(size_mb):
     return "{:.1f} MB".format(size_mb)
 
 
+def clock_text(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes, remaining_seconds = divmod(total_seconds, 60)
+    hours, remaining_minutes = divmod(minutes, 60)
+    return "{}:{:02d}:{:02d}".format(
+        hours,
+        remaining_minutes,
+        remaining_seconds,
+    )
+
+
 def progress_bar(
     terminal: Terminal,
     ratio: float,
@@ -313,43 +372,62 @@ def animate_download(
     filename: str,
     size_mb: float,
     pip_version: int,
+    network: NetworkState,
 ) -> None:
-    """Render a timed download with pip-style size, speed, and ETA fields.
+    """Render a download driven by the process-wide network speed.
 
-    Small files use kilobytes and larger files use megabytes. During a download,
-    the amount is green, speed is red, and remaining time is blue. On completion,
-    the bar turns bright green, ``eta`` becomes an empty field, and elapsed time
-    becomes yellow. Redirected output receives only the completed line.
+    Each frame integrates the changing speed over elapsed real time, then derives
+    progress and ETA from the transferred amount. Files expected to finish before
+    Rich's first refresh are allowed to complete without displaying a progress
+    line. Larger downloads retain the colored completed state in captured output.
     """
     terminal.line("  Downloading {} ({})".format(filename, human_size(size_mb)))
-    duration = random.uniform(0.65, 1.65) + min(size_mb / 35.0, 0.8)
+    estimated_duration = size_mb / max(network.speed_mb_s, MIN_SPEED_MB_S)
+    if estimated_duration < PROGRESS_REFRESH_SECONDS:
+        time.sleep(estimated_duration)
+        network.update()
+        return
+
     started = time.monotonic()
+    previous = started
+    downloaded_mb = 0.0
     width = 40 if pip_version >= 26 else 30
 
     while True:
-        elapsed = time.monotonic() - started
-        ratio = min(elapsed / duration, 1.0)
+        now = time.monotonic()
+        frame_seconds = now - previous
+        previous = now
+        speed_mb_s = network.update()
+        downloaded_mb = min(
+            size_mb,
+            downloaded_mb + speed_mb_s * frame_seconds,
+        )
+        elapsed = now - started
+        ratio = downloaded_mb / size_mb
+
+        # Determin size format
         if size_mb < 1.0:
             total = size_mb * 1024
-            downloaded = total * ratio
-            speed = total / max(duration, 0.1)
+            downloaded = downloaded_mb * 1024
             amount = "{:>5.1f}/{:.1f} kB".format(downloaded, total)
-            rate = "{:>5.1f} kB/s".format(speed)
         else:
-            downloaded = size_mb * ratio
-            speed = size_mb / max(duration, 0.1)
-            amount = "{:>5.1f}/{:.1f} MB".format(downloaded, size_mb)
-            rate = "{:>5.1f} MB/s".format(speed)
+            amount = "{:>5.1f}/{:.1f} MB".format(downloaded_mb, size_mb)
+
+        # Determin speed format
+        if speed_mb_s < 1.0:
+            rate = "{:>5.1f} kB/s".format(speed_mb_s * 1024)
+        else:
+            rate = "{:>5.1f} MB/s".format(speed_mb_s)
 
         is_finished = ratio >= 1.0
+        # Determin ETA style
         if is_finished:
             eta_label = ""
-            seconds = max(0, int(elapsed + 0.5))
-            clock = terminal.paint("0:00:{:02d}".format(seconds), terminal.YELLOW)
+            clock = terminal.paint(clock_text(elapsed), terminal.YELLOW)
         else:
             eta_label = "eta"
-            seconds = max(0, int(duration - elapsed + 0.99))
-            clock = terminal.paint("0:00:{:02d}".format(seconds), terminal.CYAN)
+            remaining_seconds = (size_mb - downloaded_mb) / speed_mb_s
+            clock = terminal.paint(clock_text(remaining_seconds), terminal.CYAN)
 
         progress = "   {} {} {} {} {}".format(
             progress_bar(terminal, ratio, width, is_finished),
@@ -409,6 +487,65 @@ def dependency_order(root_name: str) -> list[str]:
     return order
 
 
+def generate_virtual_packages(
+    count: int,
+    catalog: dict[str, Package],
+    dependency_candidates: list[str],
+) -> list[Package]:
+    """Create or reuse natural-looking fictional packages for one batch.
+
+    New names receive a stable package definition in the
+    process-wide virtual catalog; if a name appears again later, its version,
+    size, dependencies, and wheel type remain unchanged. Real package names and
+    duplicates within the current batch are rejected.
+    """
+    packages = []
+    selected_names = set()
+
+    while len(packages) < count:
+        name = random.choice(PREFIXES) + random.choice(BODYS) + random.choice(SUFFIXES)
+        if name in PACKAGES or name in selected_names:
+            continue
+
+        package = catalog.get(name)
+        if package is None:
+            major = random.choice((0, 0, 0, 1, 1, 2, 3, 4))
+            version = "{}.{}.{}".format(
+                major,
+                random.randint(0, 24),
+                random.randint(0, 18),
+            )
+
+            size_roll = random.random()
+            if size_roll < 0.65:
+                size_mb = random.uniform(0.01, 0.50)
+            elif size_roll < 0.92:
+                size_mb = random.uniform(0.50, 5.0)
+            else:
+                size_mb = random.uniform(5.0, 30.0)
+
+            dependency_count = random.randint(
+                0,
+                min(3, len(dependency_candidates)),
+            )
+            dependencies = tuple(
+                random.sample(dependency_candidates, dependency_count)
+            )
+            package = Package(
+                name,
+                version,
+                round(size_mb, 2),
+                dependencies,
+                random.random() < 0.22,
+            )
+            catalog[name] = package
+
+        packages.append(package)
+        selected_names.add(name)
+
+    return packages
+
+
 def maybe_backtrack(terminal: Terminal, package: Package) -> None:
     """Occasionally render a harmless dependency-resolution backtrack.
 
@@ -435,6 +572,7 @@ def collect_package(
     python_version: str,
     pip_version: int,
     built: list[Package],
+    network: NetworkState,
 ) -> None:
     """Render collection and track packages that need wheel builds.
 
@@ -445,7 +583,9 @@ def collect_package(
     - or a normal wheel download
 
     Native packages sometimes take the slower source-distribution path; those packages are appended to ``built`` so the
-    later build stage can render their wheel creation.
+    later build stage can render their wheel creation. 
+    ``network`` is shared by real and fictional packages, so each non-cached download inherits the speed
+    reached by the previous one.
     """
     terminal.line("Collecting {}".format(package.name))
     maybe_backtrack(terminal, package)
@@ -460,7 +600,7 @@ def collect_package(
         terminal.line("  Using cached {} ({})".format(filename, human_size(size)))
         time.sleep(random.uniform(0.12, 0.35))
     else:
-        animate_download(terminal, filename, size, pip_version)
+        animate_download(terminal, filename, size, pip_version, network)
 
     if is_source:
         animate_task(terminal, "Installing build dependencies", 0.8, 1.8)
@@ -548,13 +688,19 @@ def install_batch(
 def run_forever(args: argparse.Namespace, terminal: Terminal) -> NoReturn:
     """Continuously select and render simulated installation batches.
 
-    Root packages are shuffled and consumed in cycles. A batch contains the
-    selected root's dependency tree and may include an unrelated second tree,
-    then passes through collection, source-wheel building, and installation.
+    Root packages are shuffled and consumed in cycles. Every batch mixes one to
+    four stable fictional packages into its real dependency trees, then passes
+    through collection, source-wheel building, and installation. One network
+    state carries changing download speed across every batch.
     """
     terminal.line("Looking in indexes: https://pypi.org/simple")
     # Holds root level packages, which introduce other dependent packages 
     roots = []
+    virtual_catalog = {}
+    network = NetworkState(
+        random.uniform(MIN_SPEED_MB_S, MAX_SPEED_MB_S),
+        random.uniform(MIN_SPEED_MB_S, MAX_SPEED_MB_S),
+    )
 
     while True:
         # Refill the root level packages if empty
@@ -574,6 +720,15 @@ def run_forever(args: argparse.Namespace, terminal: Terminal) -> NoReturn:
         # Holds the packages that assigned as need-to-build
         built = []
         packages = [PACKAGES[name] for name in names]
+        virtual_packages = generate_virtual_packages(
+            random.randint(1, 4),
+            virtual_catalog,
+            names,
+        )
+        # Scatter fictional packages through real collection output.
+        for package in virtual_packages:
+            packages.insert(random.randint(0, len(packages)), package)
+
         for package in packages:
             collect_package(
                 terminal,
@@ -581,6 +736,7 @@ def run_forever(args: argparse.Namespace, terminal: Terminal) -> NoReturn:
                 args.python_version,
                 args.pip_version,
                 built,
+                network,
             )
         # Simulate the build process
         build_wheels(terminal, built, args.python_version)

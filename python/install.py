@@ -1,4 +1,24 @@
-"""Print an endless, harmless simulation of a pip install on Windows."""
+"""Print an endless, harmless simulation of a pip install on Windows.
+
+Call structure:
+    main
+    |-- parse_args
+    |-- Terminal
+    `-- run_forever
+        |-- dependency_order
+        |-- collect_package
+        |   |-- maybe_backtrack
+        |   |-- maybe_retry
+        |   |-- animate_download
+        |   `-- animate_task
+        |-- build_wheels
+        |   `-- animate_task
+        `-- install_batch
+
+Only main controls process lifetime. run_forever selects simulated dependency
+batches, while the collection, build, and installation functions only render
+one stage of a batch. No function performs network or package-manager calls.
+"""
 
 import argparse
 import ctypes
@@ -8,6 +28,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 
 PYTHON_TO_PIP = {
@@ -33,6 +54,7 @@ COMPATIBLE_PIP = {
 
 @dataclass(frozen=True)
 class Package:
+    """Simulated format of package."""
     name: str
     version: str
     size_mb: float
@@ -98,7 +120,12 @@ class Terminal:
         self._enable_windows_ansi()
 
     def _enable_windows_ansi(self):
-        """Enable ANSI processing in older Windows console hosts when possible."""
+        """Enable ANSI escape processing for an interactive Windows console.
+
+        Modern terminals usually support ANSI sequences already, but older
+        Windows console hosts require this output-mode flag. Failure is ignored
+        because color is cosmetic and plain output can continue normally.
+        """
         if os.name != "nt" or not self.interactive:
             return
         try:
@@ -130,7 +157,14 @@ class Terminal:
             self._status_visible = False
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """Resolve and validate the simulated Python and pip versions.
+
+    - ``--python`` overrides the running interpreter for all generated tags and
+    paths. 
+    - ``--pip`` has higher priority than the Python-to-pip default mapping,
+    but the final pair must still appear in ``COMPATIBLE_PIP``.
+    """
     detected = "{}.{}".format(sys.version_info.major, sys.version_info.minor)
     parser = argparse.ArgumentParser(
         description="Continuously print a simulated pip installation without installing anything."
@@ -177,9 +211,19 @@ def distribution_name(package):
     return package.name.replace("-", "_")
 
 
-def filename_for(package, python_version, source=False):
+def filename_for(
+    package: Package,
+    python_version: str,
+    is_source: bool = False,
+) -> str:
+    """Build a plausible distribution filename for a simulated download.
+
+    Source packages use ``.tar.gz``. Native wheels include the matching
+    CPython interpreter and ABI tags, while pure Python wheels use the
+    universal ``py3-none-any`` tag.
+    """
     name = distribution_name(package)
-    if source:
+    if is_source:
         return "{}-{}.tar.gz".format(name, package.version)
     if package.native:
         tag = wheel_tag(python_version)
@@ -193,7 +237,18 @@ def human_size(size_mb):
     return "{:.1f} MB".format(size_mb)
 
 
-def animate_task(terminal, label, minimum=0.45, maximum=1.15):
+def animate_task(
+    terminal: Terminal,
+    label: str,
+    minimum: float = 0.45,
+    maximum: float = 1.15,
+) -> None:
+    """Render a spinner-style task that finishes after a random duration.
+
+    Interactive terminals receive an in-place spinner followed by a permanent
+    completion line. Redirected output skips animation and emits only the final
+    line, keeping captured logs compact.
+    """
     duration = random.uniform(minimum, maximum)
     if not terminal.interactive:
         time.sleep(duration)
@@ -213,7 +268,18 @@ def animate_task(terminal, label, minimum=0.45, maximum=1.15):
     terminal.line("{} ... done".format(label))
 
 
-def animate_download(terminal, filename, size_mb, pip_version):
+def animate_download(
+    terminal: Terminal,
+    filename: str,
+    size_mb: float,
+    pip_version: int,
+) -> None:
+    """Render a timed download with pip-style size, speed, and ETA fields.
+
+    Small files use kilobytes and larger files use megabytes. Progress updates
+    overwrite one terminal line when interactive; redirected output receives
+    only the completed progress line. No network request is made.
+    """
     terminal.line("  Downloading {} ({})".format(filename, human_size(size_mb)))
     duration = random.uniform(0.65, 1.65) + min(size_mb / 35.0, 0.8)
     started = time.monotonic()
@@ -250,7 +316,13 @@ def animate_download(terminal, filename, size_mb, pip_version):
     terminal.line(progress)
 
 
-def maybe_retry(terminal, package):
+def maybe_retry(terminal: Terminal, package: Package) -> None:
+    """Occasionally inject a recoverable network warning into collection.
+
+    Most calls return immediately. Selected calls print a realistic pip timeout
+    message and pause briefly, then allow collection to continue rather than
+    raising an error or changing package state.
+    """
     if random.random() >= 0.10:
         return
     retries = random.choice((2, 3, 4))
@@ -262,7 +334,13 @@ def maybe_retry(terminal, package):
     time.sleep(random.uniform(0.5, 1.1))
 
 
-def dependency_order(root_name):
+def dependency_order(root_name: str) -> list[str]:
+    """Return a randomized depth-first package order starting at ``root_name``.
+
+    Each package is included once, before its recursively visited dependencies.
+    Dependency lists are shuffled so repeated batches remain visually varied,
+    while the visited set prevents duplicate entries in shared dependency trees.
+    """
     order = []
     visited = set()
 
@@ -280,7 +358,13 @@ def dependency_order(root_name):
     return order
 
 
-def maybe_backtrack(terminal, package):
+def maybe_backtrack(terminal: Terminal, package: Package) -> None:
+    """Occasionally render a harmless dependency-resolution backtrack.
+
+    The output announces that pip is comparing versions, waits briefly, and
+    prints metadata for a fabricated older release. It does not alter the
+    package selected for the later download or installation stages.
+    """
     if random.random() >= 0.12:
         return
     terminal.line(
@@ -294,23 +378,40 @@ def maybe_backtrack(terminal, package):
     ))
 
 
-def collect_package(terminal, package, python_version, pip_version, built):
+def collect_package(
+    terminal: Terminal,
+    package: Package,
+    python_version: str,
+    pip_version: int,
+    built: list[Package],
+) -> None:
+    """Render collection and track packages that need wheel builds.
+
+    The function may show:
+    - resolver backtracking
+    - a network retry
+    - a cache hit
+    - or a normal wheel download
+
+    Native packages sometimes take the slower source-distribution path; those packages are appended to ``built`` so the
+    later build stage can render their wheel creation.
+    """
     terminal.line("Collecting {}".format(package.name))
     maybe_backtrack(terminal, package)
     maybe_retry(terminal, package)
 
     # Native projects occasionally take the slower source-distribution route.
-    source = package.native and random.random() < 0.22
-    filename = filename_for(package, python_version, source)
-    size = package.size_mb * (0.45 if source else 1.0)
+    is_source = package.native and random.random() < 0.22
+    filename = filename_for(package, python_version, is_source)
+    size = package.size_mb * (0.45 if is_source else 1.0)
 
-    if random.random() < 0.18 and not source:
+    if random.random() < 0.18 and not is_source:
         terminal.line("  Using cached {} ({})".format(filename, human_size(size)))
         time.sleep(random.uniform(0.12, 0.35))
     else:
         animate_download(terminal, filename, size, pip_version)
 
-    if source:
+    if is_source:
         animate_task(terminal, "Installing build dependencies", 0.8, 1.8)
         animate_task(terminal, "Getting requirements to build wheel", 0.45, 1.0)
         animate_task(terminal, "Preparing metadata (pyproject.toml)", 0.5, 1.2)
@@ -321,7 +422,17 @@ def collect_package(terminal, package, python_version, pip_version, built):
         time.sleep(random.uniform(0.12, 0.32))
 
 
-def build_wheels(terminal, packages, python_version):
+def build_wheels(
+    terminal: Terminal,
+    packages: list[Package],
+    python_version: str,
+) -> None:
+    """Render wheel builds for packages collected as source distributions.
+
+    Each package receives a timed build task followed by a plausible wheel
+    filename, byte size, SHA-256 digest, and Windows pip cache path. The cache
+    path is display-only; no directory or wheel file is created.
+    """
     if not packages:
         return
     terminal.line("Building wheels for collected packages: {}".format(
@@ -346,7 +457,18 @@ def build_wheels(terminal, packages, python_version):
         terminal.line("  Stored in directory: {}".format(cache))
 
 
-def install_batch(terminal, packages, pip_version):
+def install_batch(
+    terminal: Terminal,
+    packages: list[Package],
+    pip_version: int,
+) -> None:
+    """Render installation of one resolved package batch without completing it.
+
+    Package names are displayed in reverse collection order to resemble pip's
+    dependency installation sequence. Pip 25 and newer styles also receive an
+    in-place package counter; older styles use a simple delay. No success line
+    is printed, allowing the next batch to continue the simulation naturally.
+    """
     names = [package.name for package in reversed(packages)]
     terminal.line("Installing collected packages: {}".format(", ".join(names)))
 
@@ -367,12 +489,19 @@ def install_batch(terminal, packages, pip_version):
         time.sleep(random.uniform(0.8, 1.8))
 
 
-def run_forever(args, terminal):
+def run_forever(args: argparse.Namespace, terminal: Terminal) -> NoReturn:
+    """Continuously select and render simulated installation batches.
+
+    Root packages are shuffled and consumed in cycles. A batch contains the
+    selected root's dependency tree and may include an unrelated second tree,
+    then passes through collection, source-wheel building, and installation.
+    """
     terminal.line("Looking in indexes: https://pypi.org/simple")
-    roots = list(ROOT_PACKAGES)
-    random.shuffle(roots)
+    # Holds root level packages, which introduce other dependent packages 
+    roots = []
 
     while True:
+        # Refill the root level packages if empty
         if not roots:
             roots = list(ROOT_PACKAGES)
             random.shuffle(roots)
@@ -386,6 +515,7 @@ def run_forever(args, terminal):
                 if name not in names:
                     names.append(name)
 
+        # Holds the packages that assigned as need-to-build
         built = []
         packages = [PACKAGES[name] for name in names]
         for package in packages:
@@ -396,11 +526,14 @@ def run_forever(args, terminal):
                 args.pip_version,
                 built,
             )
+        # Simulate the build process
         build_wheels(terminal, built, args.python_version)
+        # Simulate the install process
         install_batch(terminal, packages, args.pip_version)
 
 
-def main():
+def main() -> int:
+    """Configure the console, parse options, and start the endless simulation."""
     try:
         # Keep Unicode progress bars intact in redirected or older Windows hosts.
         if hasattr(sys.stdout, "reconfigure"):

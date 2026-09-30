@@ -4,12 +4,32 @@
 /**
  * Endless, display-only npm installation simulator.
  *
+ * Call structure:
+ *   main
+ *   |-- parseArgs
+ *   |   `-- detectNpm
+ *   |-- Terminal
+ *   `-- runForever
+ *       |-- NetworkState
+ *       |-- dependencyOrder
+ *       |-- virtualPackages
+ *       |-- collectPackage
+ *       |   `-- download
+ *       |       `-- NetworkState.update
+ *       |-- buildPackages
+ *       `-- installBatch
+ *
  * main owns the process lifetime; runForever chooses batches; collectPackage,
  * buildPackages and installBatch only render one stage. No package-manager
  * installation, network request or file write is performed by this script.
  */
 
 const { execFileSync } = require("node:child_process");
+
+/** @typedef {{name: string, version: string, sizeMb: number, dependencies: string[], native: boolean}} Package */
+/** @typedef {{text: string, parts: number[]}} ParsedVersion */
+/** @typedef {{package: Package, parent: string}} PackageEntry */
+/** @typedef {{node: ParsedVersion, npm: ParsedVersion, verbose: boolean}} Options */
 
 const MIN_SPEED_MB_S = 0.3;
 const MAX_SPEED_MB_S = 3.5;
@@ -75,6 +95,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Parse a one-to-three-part version for comparison without losing its CLI form.
+ * @param {string} value
+ * @param {string} flag - Option name used in validation errors.
+ * @returns {ParsedVersion}
+ */
 function version(value, flag) {
   if (!/^\d+(?:\.\d+){0,2}$/.test(value)) {
     throw new Error(`${flag} must have one to three numeric parts (for example, 22.9.0)`);
@@ -93,6 +119,11 @@ function atLeast(actual, minimum) {
   return true;
 }
 
+/**
+ * Query the installed npm version, independently of the Node.js version.
+ * @returns {string} The output of `npm --version`.
+ * @throws {Error} If npm cannot be queried; --npm can bypass detection.
+ */
 function detectNpm() {
   try {
     // On Windows npm is usually a .cmd file; invoke the command interpreter
@@ -109,6 +140,11 @@ function detectNpm() {
   }
 }
 
+/**
+ * Resolve CLI overrides and validate the simulated Node.js/npm pairing.
+ * @param {string[]} argv - Arguments after the script path.
+ * @returns {Options | {help: true}}
+ */
 function parseArgs(argv) {
   let nodeOverride;
   let npmOverride;
@@ -146,6 +182,7 @@ function parseArgs(argv) {
   return { node, npm, verbose };
 }
 
+/** Render transient status on TTYs and durable lines in redirected output. */
 class Terminal {
   constructor() {
     this.interactive = Boolean(process.stdout.isTTY);
@@ -176,12 +213,14 @@ class Terminal {
   }
 }
 
+/** Keep one drifting download speed across every package and batch. */
 class NetworkState {
   constructor() {
     this.speed = between(MIN_SPEED_MB_S, MAX_SPEED_MB_S);
     this.target = between(MIN_SPEED_MB_S, MAX_SPEED_MB_S);
   }
 
+  /** Advance the shared speed by one download frame, in MB/s. @returns {number} */
   update() {
     if (Math.random() < 0.03) this.target = between(MIN_SPEED_MB_S, MAX_SPEED_MB_S);
     this.speed = Math.max(MIN_SPEED_MB_S, Math.min(MAX_SPEED_MB_S,
@@ -190,6 +229,11 @@ class NetworkState {
   }
 }
 
+/**
+ * Walk a real root's dependency graph once, recording each package's parent.
+ * @param {string} root - Name in PACKAGES.
+ * @returns {PackageEntry[]} Root first, then its shuffled dependencies.
+ */
 function dependencyOrder(root) {
   const entries = [];
   const visited = new Set();
@@ -205,6 +249,13 @@ function dependencyOrder(root) {
   return entries;
 }
 
+/**
+ * Mix in fictional packages without changing their definitions across batches.
+ * @param {number} count - Number of distinct fictional packages in this batch.
+ * @param {Map<string, Package>} catalog - Process-wide virtual package catalog.
+ * @param {string[]} candidates - Real packages eligible as dependencies.
+ * @returns {Package[]}
+ */
 function virtualPackages(count, catalog, candidates) {
   const selected = new Set();
   const result = [];
@@ -228,6 +279,14 @@ function tarball(packageInfo) {
   return `https://registry.npmjs.org/${name}/-/${name}-${release}.tgz`;
 }
 
+/**
+ * Simulate a tarball transfer using elapsed time and the shared network speed.
+ * @param {Terminal} terminal
+ * @param {Package} packageInfo
+ * @param {NetworkState} network - Reused by all downloads.
+ * @param {boolean} verbose - Show npm-style fetch details when true.
+ * @returns {Promise<void>}
+ */
 async function download(terminal, packageInfo, network, verbose) {
   const total = packageInfo.sizeMb;
   const url = tarball(packageInfo);
@@ -252,6 +311,15 @@ async function download(terminal, packageInfo, network, verbose) {
   }
 }
 
+/**
+ * Render one package's cache hit or download and queue occasional native builds.
+ * @param {Terminal} terminal
+ * @param {PackageEntry} entry
+ * @param {NetworkState} network
+ * @param {boolean} verbose
+ * @param {Package[]} builds - Output list of packages requiring a build step.
+ * @returns {Promise<void>}
+ */
 async function collectPackage(terminal, entry, network, verbose, builds) {
   const item = entry.package;
   if (verbose) {
@@ -272,6 +340,13 @@ async function collectPackage(terminal, entry, network, verbose, builds) {
   if (item.native && Math.random() < 0.3) builds.push(item);
 }
 
+/**
+ * Display simulated native install scripts for this batch.
+ * @param {Terminal} terminal
+ * @param {Package[]} builds
+ * @param {boolean} verbose
+ * @returns {Promise<void>}
+ */
 async function buildPackages(terminal, builds, verbose) {
   for (const item of builds) {
     if (verbose) terminal.line(`npm info run ${item.name}@${item.version} install node_modules/${item.name} node install.js`);
@@ -283,6 +358,13 @@ async function buildPackages(terminal, builds, verbose) {
   }
 }
 
+/**
+ * Display reification progress without a final success line before the next batch.
+ * @param {Terminal} terminal
+ * @param {PackageEntry[]} entries
+ * @param {boolean} verbose
+ * @returns {Promise<void>}
+ */
 async function installBatch(terminal, entries, verbose) {
   const duration = between(700, 1500);
   const start = performance.now();
@@ -297,6 +379,13 @@ async function installBatch(terminal, entries, verbose) {
   // Deliberately no "added N packages" or audit summary: another batch follows.
 }
 
+/**
+ * Repeatedly mix real dependency trees with stable fictional packages, sharing
+ * one network state across every collection/build/install cycle.
+ * @param {Options} args
+ * @param {Terminal} terminal
+ * @returns {Promise<never>} Runs until interrupted or an error occurs.
+ */
 async function runForever(args, terminal) {
   if (args.verbose) {
     terminal.line(`npm verbose cli node ${args.node.text} npm ${args.npm.text}`);
@@ -330,6 +419,7 @@ async function runForever(args, terminal) {
   }
 }
 
+/** Parse options, install signal handlers, and start the endless simulation. */
 function main() {
   let args;
   try {

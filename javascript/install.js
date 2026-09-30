@@ -233,6 +233,8 @@ class Terminal {
   stop() {
     clearTimeout(this.delay);
     clearInterval(this.interval);
+    this.delay = null;
+    this.interval = null;
     this.clear();
   }
 

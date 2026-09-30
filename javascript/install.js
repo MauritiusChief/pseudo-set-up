@@ -7,7 +7,8 @@
  * Call structure:
  *   main
  *   |-- parseArgs
- *   |   `-- detectNpm
+ *   |   |-- detectNpm (no overrides)
+ *   |   `-- defaultNpmForNode (--node without --npm)
  *   |-- Terminal
  *   `-- runForever
  *       |-- NetworkState
@@ -27,7 +28,7 @@
 const { execFileSync } = require("node:child_process");
 
 /** @typedef {{name: string, version: string, sizeMb: number, dependencies: string[], native: boolean}} Package */
-/** @typedef {{text: string, parts: number[]}} ParsedVersion */
+/** @typedef {{text: string, parts: number[], precision: number}} ParsedVersion */
 /** @typedef {{package: Package, parent: string}} PackageEntry */
 /** @typedef {{node: ParsedVersion, npm: ParsedVersion, loglevel: string}} Options */
 
@@ -36,6 +37,18 @@ const MAX_SPEED_MB_S = 3.5;
 const FRAME_MS = 150;
 const LOG_LEVELS = ["error", "warn", "notice", "http", "info", "verbose"];
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const LEGACY_FRAMES = ["-", "\\", "|", "/"];
+
+// Representative official Node builds and their bundled npm versions. A
+// major-only --node selects the representative; a precise old Node version
+// may instead need the older, compatible npm fallback below.
+const NODE_TO_NPM = {
+  18: { node: "18.20.8", npm: "10.8.2" },
+  20: { node: "20.20.2", npm: "10.9.9" },
+  22: { node: "22.23.3", npm: "11.19.0" },
+  24: { node: "24.21.0", npm: "11.19.1" },
+  26: { node: "26.10.0", npm: "11.19.1" },
+};
 
 function pkg(name, version, sizeMb, dependencies = [], native = false) {
   return { name, version, sizeMb, dependencies, native };
@@ -111,7 +124,7 @@ function version(value, flag) {
   if (parts.some((part) => !Number.isSafeInteger(part))) {
     throw new Error(`${flag} contains a number that is too large`);
   }
-  return { text: value, parts: [parts[0], parts[1] ?? 0, parts[2] ?? 0] };
+  return { text: value, parts: [parts[0], parts[1] ?? 0, parts[2] ?? 0], precision: parts.length };
 }
 
 function atLeast(actual, minimum) {
@@ -121,10 +134,43 @@ function atLeast(actual, minimum) {
   return true;
 }
 
+/** Validate npm's published engine ranges rather than inferring from Node alone. */
+function compatible(nodeParts, npmMajor) {
+  const major = nodeParts[0];
+  if (npmMajor === 9) return atLeast(nodeParts, [18, 0, 0]);
+  if (npmMajor === 10) {
+    return (major === 18 && atLeast(nodeParts, [18, 17, 0])) || atLeast(nodeParts, [20, 5, 0]);
+  }
+  if (npmMajor === 11) {
+    return (major === 20 && atLeast(nodeParts, [20, 17, 0])) || atLeast(nodeParts, [22, 9, 0]);
+  }
+  if (npmMajor === 12) {
+    return (major === 22 && atLeast(nodeParts, [22, 22, 2])) ||
+      (major === 24 && atLeast(nodeParts, [24, 15, 0])) || major >= 26;
+  }
+  return true; // Do not guess the requirements of future npm releases.
+}
+
+/** Infer npm from a simulated Node release without querying the installed npm. */
+function defaultNpmForNode(node) {
+  const representative = NODE_TO_NPM[node.parts[0]];
+  if (!representative) {
+    throw new Error(`No bundled npm mapping for Node.js ${node.text}; pass --npm VERSION`);
+  }
+  const release = node.precision === 1 ? version(representative.node, "--node") : node;
+  const bundled = version(representative.npm, "--npm");
+  if (compatible(release.parts, bundled.parts[0])) return bundled;
+
+  // Earlier point releases of Node 18/20/22 predate their representative
+  // bundled npm. Choose a compatible prior line, keeping --npm authoritative.
+  const fallback = node.parts[0] === 22 ? "10.9.9" : "9.9.4";
+  return version(fallback, "--npm");
+}
+
 /**
- * Query the installed npm version, independently of the Node.js version.
+ * Query the installed npm version only when neither version is overridden.
  * @returns {string} The output of `npm --version`.
- * @throws {Error} If npm cannot be queried; --npm can bypass detection.
+ * @throws {Error} If npm cannot be queried; --node or --npm bypasses detection.
  */
 function detectNpm() {
   try {
@@ -171,31 +217,36 @@ function parseArgs(argv) {
   }
 
   const node = version(nodeOverride ?? process.versions.node, "--node");
-  const npm = version(npmOverride ?? detectNpm(), "--npm");
+  const npm = npmOverride ? version(npmOverride, "--npm")
+    : nodeOverride ? defaultNpmForNode(node) : version(detectNpm(), "--npm");
   if (!atLeast(node.parts, [18, 0, 0]) || !atLeast(npm.parts, [9, 0, 0])) {
     throw new Error("This simulator supports Node.js 18+ and npm 9+");
   }
-  // Validate the known npm 10/11 engine ranges for manual overrides. Newer
-  // npm majors are left open rather than guessing their future requirements.
-  const npmMajor = npm.parts[0];
-  const nodeMajor = node.parts[0];
-  const npm10Supported = (nodeMajor === 18 && atLeast(node.parts, [18, 17, 0])) || nodeMajor >= 20;
-  const npm11Supported = (nodeMajor === 20 && atLeast(node.parts, [20, 17, 0])) ||
-    atLeast(node.parts, [22, 9, 0]);
-  if ((npmMajor === 10 && !npm10Supported) || (npmMajor === 11 && !npm11Supported)) {
+  // A major-only --node represents the mapped official release for engine
+  // checks, while e.g. --node 22.0.0 means exactly that older release.
+  const checkedNode = nodeOverride && node.precision === 1 && NODE_TO_NPM[node.parts[0]]
+    ? version(NODE_TO_NPM[node.parts[0]].node, "--node") : node;
+  if (!compatible(checkedNode.parts, npm.parts[0])) {
     throw new Error(`npm ${npm.text} is not compatible with Node.js ${node.text}`);
   }
   return { node, npm, loglevel };
 }
 
-/** Filter and color npm-style logs; manage an independent stderr spinner. */
+/** Filter npm logs and render progress in the selected npm version's style. */
 class Terminal {
-  constructor(loglevel) {
+  constructor(loglevel, npm) {
     this.loglevel = LOG_LEVELS.indexOf(loglevel);
     this.color = Boolean(process.stderr.isTTY) && !("NO_COLOR" in process.env);
     this.interactive = Boolean(process.stderr.isTTY);
+    // npm 9 and early 10 use npmlog/gauge; 10.6 had an unfinished
+    // transition; 10.7+ uses a standalone spinner in the display layer.
+    this.style = npm.parts[0] < 10 || (npm.parts[0] === 10 && !atLeast(npm.parts, [10, 6, 0]))
+      ? "gauge" : npm.parts[0] === 10 && !atLeast(npm.parts, [10, 7, 0])
+        ? "transition" : "spinner";
     this.rendered = false;
     this.frame = 0;
+    this.ratio = 0;
+    this.section = "idealTree";
     this.delay = null;
     this.interval = null;
   }
@@ -205,12 +256,12 @@ class Terminal {
   }
 
   start() {
-    if (!this.interactive) return;
+    if (!this.interactive || this.style === "transition") return;
     // npm delays the spinner to avoid flashing on commands that finish quickly.
     this.delay = setTimeout(() => {
       this.delay = null;
       this.draw();
-      this.interval = setInterval(() => this.draw(), 80);
+      this.interval = setInterval(() => this.draw(), this.style === "spinner" ? 80 : 100);
       this.interval.unref();
     }, 200);
     this.delay.unref();
@@ -218,9 +269,25 @@ class Terminal {
 
   draw() {
     this.clear();
-    this.frame = (this.frame + 1) % SPINNER_FRAMES.length;
-    process.stderr.write(SPINNER_FRAMES[this.frame]);
+    const frames = this.style === "gauge" ? LEGACY_FRAMES : SPINNER_FRAMES;
+    this.frame = (this.frame + 1) % frames.length;
+    if (this.style === "gauge") {
+      const width = 20;
+      const filled = Math.floor(this.ratio * width);
+      process.stderr.write(`${this.paint("█".repeat(filled), "32")}${"░".repeat(width - filled)} ` +
+        `${frames[this.frame]} ${this.section}`);
+    } else {
+      process.stderr.write(frames[this.frame]);
+    }
     this.rendered = true;
+  }
+
+  /** Feed real-time simulated transfer progress to legacy npm's gauge. */
+  progress(ratio, section) {
+    if (this.style !== "gauge") return;
+    this.ratio = Math.max(0, Math.min(1, ratio));
+    this.section = section;
+    if (this.interval) this.draw();
   }
 
   clear() {
@@ -242,9 +309,14 @@ class Terminal {
   log(level, title, message) {
     if (LOG_LEVELS.indexOf(level) > this.loglevel) return;
     this.clear();
-    const colors = { error: "31", warn: "33", notice: "96", http: "32", info: "36", verbose: "34" };
-    const prefix = this.paint("npm", "1") + " " + this.paint(level, colors[level]);
-    const label = title ? ` ${this.paint(title, "94")}` : "";
+    const legacy = this.style === "gauge";
+    const colors = legacy
+      ? { error: "31", warn: "30;43", notice: "36", http: "32", info: "32", verbose: "36" }
+      : { error: "31", warn: "33", notice: "96", http: "32", info: "36", verbose: "34" };
+    const names = { error: "ERR!", warn: "WARN", verbose: "verb" };
+    const prefix = (legacy ? "npm" : this.paint("npm", "1")) + " " +
+      this.paint(legacy ? names[level] || level : level, colors[level]);
+    const label = title ? ` ${this.paint(title, legacy ? "35" : "94")}` : "";
     process.stderr.write(`${prefix}${label}${message ? ` ${message}` : ""}\n`);
     if (this.interval) this.draw();
   }
@@ -335,8 +407,9 @@ async function download(terminal, packageInfo, network) {
     const speed = network.update();
     transferred = Math.min(total, transferred + speed * (now - previous) / 1000);
     previous = now;
-    // No per-package progress line: npm renders one spinner independently
-    // of the transfer. Elapsed time still follows the shared network speed.
+    // The gauge uses actual simulated bytes; modern npm's spinner does not
+    // show per-package percentages, but still shares this transfer rate.
+    terminal.progress(transferred / total, `reify ${packageInfo.name}`);
   }
   terminal.log("http", "fetch", `GET 200 ${url} ${Math.round(performance.now() - started)}ms (cache miss)`);
 }
@@ -358,6 +431,7 @@ async function collectPackage(terminal, entry, network, builds) {
   }
   if (cached) {
     await sleep(between(90, 250));
+    terminal.progress(1, `reify ${item.name}`);
     terminal.log("http", "fetch", `GET 200 ${tarball(item)} 0ms (cache hit)`);
   } else {
     await download(terminal, item, network);
@@ -373,21 +447,30 @@ async function collectPackage(terminal, entry, network, builds) {
  */
 async function buildPackages(terminal, builds) {
   for (const item of builds) {
+    terminal.progress(0, `build ${item.name}`);
     terminal.log("info", "run", `${item.name}@${item.version} install node_modules/${item.name} node install.js`);
     const duration = between(600, 1400);
     await sleep(duration);
+    terminal.progress(1, `build ${item.name}`);
     terminal.log("info", "run", `${item.name}@${item.version} install { code: 0, signal: null }`);
   }
 }
 
 /**
  * Wait for simulated reification without printing a final success line.
+ * @param {Terminal} terminal
  * @returns {Promise<void>}
  */
-async function installBatch() {
+async function installBatch(terminal) {
   // Reification takes time but npm prints its summary only once it finishes.
   // A new batch follows, so neither a success line nor a fabricated log is emitted.
-  await sleep(between(700, 1500));
+  const duration = between(700, 1500);
+  const start = performance.now();
+  while (performance.now() - start < duration) {
+    terminal.progress((performance.now() - start) / duration, "reify");
+    await sleep(100);
+  }
+  terminal.progress(1, "reify");
 }
 
 /**
@@ -408,6 +491,7 @@ async function runForever(args, terminal) {
   let roots = [];
   while (true) {
     if (roots.length === 0) roots = shuffle([...ROOT_PACKAGES]);
+    terminal.progress(0, "idealTree");
     const entries = dependencyOrder(roots.pop());
     const known = new Set(entries.map((entry) => entry.package.name));
     if (Math.random() < 0.4) {
@@ -424,7 +508,7 @@ async function runForever(args, terminal) {
     const builds = [];
     for (const entry of entries) await collectPackage(terminal, entry, network, builds);
     await buildPackages(terminal, builds);
-    await installBatch();
+    await installBatch(terminal);
   }
 }
 
@@ -441,12 +525,12 @@ function main() {
   if (args.help) {
     console.log("Usage: node install.js [--node VERSION] [--npm VERSION] [--loglevel LEVEL]\n" +
       "Log levels: notice (default), http, info, verbose.\n" +
-      "Simulate an endless npm install; versions default to the installed Node.js and npm.\n" +
+      "By default, detect installed Node.js and npm; --node alone infers a bundled npm version.\n" +
       "Press Ctrl+C to stop. No packages are installed.");
     return;
   }
 
-  const terminal = new Terminal(args.loglevel);
+  const terminal = new Terminal(args.loglevel, args.npm);
   const stop = (signal) => {
     terminal.stop();
     terminal.log("error", "", `process terminated (${signal})`);

@@ -19,9 +19,11 @@ python .\install.py --python 3.12 --pip 25.1
 python .\install.py --python 3.14 --pip 26.0.1
 ```
 
-## JavaScript (npm)
+## JavaScript
 
-Copy `javascript/install.js` into a project and run it with Node.js 18+ and npm 9+:
+### npm
+
+Copy `javascript/node/install.js` into a project and run it with Node.js 18+ and npm 9+:
 
 ```powershell
 node .\install.js

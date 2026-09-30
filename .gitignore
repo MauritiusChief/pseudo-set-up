@@ -1,2 +1,5 @@
 .venv*
 requirements.txt
+node_modules/
+.npm-cache/
+reference

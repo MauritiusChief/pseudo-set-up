@@ -28,13 +28,10 @@ node .\install.js
 ```
 
 The script detects the installed Node.js and npm versions. Override either version,
-or enable per-package npm-style logs, with:
+or choose an npm-style log level, with:
 
 ```powershell
 node .\install.js --node 22.9.0 --npm 11.0.0
-node .\install.js --verbose
+node .\install.js --loglevel verbose
 node .\install.js --help
 ```
-
-The default output is concise; `--verbose` shows dependency resolution, cache
-hits and simulated registry fetches.

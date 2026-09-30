@@ -29,11 +29,13 @@ const { execFileSync } = require("node:child_process");
 /** @typedef {{name: string, version: string, sizeMb: number, dependencies: string[], native: boolean}} Package */
 /** @typedef {{text: string, parts: number[]}} ParsedVersion */
 /** @typedef {{package: Package, parent: string}} PackageEntry */
-/** @typedef {{node: ParsedVersion, npm: ParsedVersion, verbose: boolean}} Options */
+/** @typedef {{node: ParsedVersion, npm: ParsedVersion, loglevel: string}} Options */
 
 const MIN_SPEED_MB_S = 0.3;
 const MAX_SPEED_MB_S = 3.5;
 const FRAME_MS = 150;
+const LOG_LEVELS = ["error", "warn", "notice", "http", "info", "verbose"];
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 function pkg(name, version, sizeMb, dependencies = [], native = false) {
   return { name, version, sizeMb, dependencies, native };
@@ -148,12 +150,16 @@ function detectNpm() {
 function parseArgs(argv) {
   let nodeOverride;
   let npmOverride;
-  let verbose = false;
+  let loglevel = "notice";
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") return { help: true };
-    if (arg === "--verbose") {
-      verbose = true;
+    if (arg === "--loglevel" || arg.startsWith("--loglevel=")) {
+      const value = arg === "--loglevel" ? argv[++i] : arg.slice("--loglevel=".length);
+      if (!LOG_LEVELS.slice(2).includes(value)) {
+        throw new Error(`--loglevel must be one of notice, http, info, verbose`);
+      }
+      loglevel = value;
     } else if (arg === "--node" || arg === "--npm") {
       const value = argv[++i];
       if (!value) throw new Error(`${arg} requires a version`);
@@ -179,37 +185,66 @@ function parseArgs(argv) {
   if ((npmMajor === 10 && !npm10Supported) || (npmMajor === 11 && !npm11Supported)) {
     throw new Error(`npm ${npm.text} is not compatible with Node.js ${node.text}`);
   }
-  return { node, npm, verbose };
+  return { node, npm, loglevel };
 }
 
-/** Render transient status on TTYs and durable lines in redirected output. */
+/** Filter and color npm-style logs; manage an independent stderr spinner. */
 class Terminal {
-  constructor() {
-    this.interactive = Boolean(process.stdout.isTTY);
-    this.color = this.interactive && !("NO_COLOR" in process.env);
-    this.visible = false;
+  constructor(loglevel) {
+    this.loglevel = LOG_LEVELS.indexOf(loglevel);
+    this.color = Boolean(process.stderr.isTTY) && !("NO_COLOR" in process.env);
+    this.interactive = Boolean(process.stderr.isTTY);
+    this.rendered = false;
+    this.frame = 0;
+    this.delay = null;
+    this.interval = null;
   }
 
   paint(text, code) {
     return this.color ? `\x1b[${code}m${text}\x1b[0m` : text;
   }
 
+  start() {
+    if (!this.interactive) return;
+    // npm delays the spinner to avoid flashing on commands that finish quickly.
+    this.delay = setTimeout(() => {
+      this.delay = null;
+      this.draw();
+      this.interval = setInterval(() => this.draw(), 80);
+      this.interval.unref();
+    }, 200);
+    this.delay.unref();
+  }
+
+  draw() {
+    this.clear();
+    this.frame = (this.frame + 1) % SPINNER_FRAMES.length;
+    process.stderr.write(SPINNER_FRAMES[this.frame]);
+    this.rendered = true;
+  }
+
   clear() {
-    if (this.visible) {
-      process.stdout.write("\r\x1b[2K");
-      this.visible = false;
+    if (this.rendered) {
+      process.stderr.write("\r\x1b[0K");
+      this.rendered = false;
     }
   }
 
-  line(text) {
+  stop() {
+    clearTimeout(this.delay);
+    clearInterval(this.interval);
     this.clear();
-    process.stdout.write(`${text}\n`);
   }
 
-  status(text) {
-    if (!this.interactive) return;
-    process.stdout.write(`\r\x1b[2K${text}`);
-    this.visible = true;
+  /** Emit levels up to the selected threshold; npm writes log records to stderr. */
+  log(level, title, message) {
+    if (LOG_LEVELS.indexOf(level) > this.loglevel) return;
+    this.clear();
+    const colors = { error: "31", warn: "33", notice: "96", http: "32", info: "36", verbose: "34" };
+    const prefix = this.paint("npm", "1") + " " + this.paint(level, colors[level]);
+    const label = title ? ` ${this.paint(title, "94")}` : "";
+    process.stderr.write(`${prefix}${label}${message ? ` ${message}` : ""}\n`);
+    if (this.interval) this.draw();
   }
 }
 
@@ -284,10 +319,9 @@ function tarball(packageInfo) {
  * @param {Terminal} terminal
  * @param {Package} packageInfo
  * @param {NetworkState} network - Reused by all downloads.
- * @param {boolean} verbose - Show npm-style fetch details when true.
  * @returns {Promise<void>}
  */
-async function download(terminal, packageInfo, network, verbose) {
+async function download(terminal, packageInfo, network) {
   const total = packageInfo.sizeMb;
   const url = tarball(packageInfo);
   const started = performance.now();
@@ -299,16 +333,10 @@ async function download(terminal, packageInfo, network, verbose) {
     const speed = network.update();
     transferred = Math.min(total, transferred + speed * (now - previous) / 1000);
     previous = now;
-    const percent = Math.floor(transferred / total * 100);
-    const eta = Math.ceil((total - transferred) / speed);
-    terminal.status(`npm install ${packageInfo.name}@${packageInfo.version} ${percent}% ` +
-      `${speed.toFixed(1)} MB/s eta ${eta}s`);
+    // No per-package progress line: npm renders one spinner independently
+    // of the transfer. Elapsed time still follows the shared network speed.
   }
-  if (verbose) {
-    terminal.line(`npm http fetch GET 200 ${url} ${Math.round(performance.now() - started)}ms (cache miss)`);
-  } else if (!terminal.interactive) {
-    terminal.line(`npm install ${packageInfo.name}@${packageInfo.version} fetched`);
-  }
+  terminal.log("http", "fetch", `GET 200 ${url} ${Math.round(performance.now() - started)}ms (cache miss)`);
 }
 
 /**
@@ -316,26 +344,21 @@ async function download(terminal, packageInfo, network, verbose) {
  * @param {Terminal} terminal
  * @param {PackageEntry} entry
  * @param {NetworkState} network
- * @param {boolean} verbose
  * @param {Package[]} builds - Output list of packages requiring a build step.
  * @returns {Promise<void>}
  */
-async function collectPackage(terminal, entry, network, verbose, builds) {
+async function collectPackage(terminal, entry, network, builds) {
   const item = entry.package;
-  if (verbose) {
-    terminal.line(`npm sill placeDep ${entry.parent || "ROOT"} ${item.name}@${item.version} OK`);
-  }
-  if (Math.random() < 0.08) {
-    terminal.line(terminal.paint(`npm warn tarball tarball data for ${item.name}@${tarball(item)} seems to be corrupted. Trying again.`, "33"));
+  const cached = Math.random() < 0.2;
+  if (!cached && Math.random() < 0.03) {
+    terminal.log("warn", "tarball", `tarball data for ${item.name}@${tarball(item)} seems to be corrupted. Trying again.`);
     await sleep(between(300, 700));
   }
-  const cached = Math.random() < 0.2;
   if (cached) {
     await sleep(between(90, 250));
-    if (verbose) terminal.line(`npm http fetch GET 200 ${tarball(item)} 0ms (cache hit)`);
-    else if (!terminal.interactive) terminal.line(`npm install ${item.name}@${item.version} cached`);
+    terminal.log("http", "fetch", `GET 200 ${tarball(item)} 0ms (cache hit)`);
   } else {
-    await download(terminal, item, network, verbose);
+    await download(terminal, item, network);
   }
   if (item.native && Math.random() < 0.3) builds.push(item);
 }
@@ -344,39 +367,25 @@ async function collectPackage(terminal, entry, network, verbose, builds) {
  * Display simulated native install scripts for this batch.
  * @param {Terminal} terminal
  * @param {Package[]} builds
- * @param {boolean} verbose
  * @returns {Promise<void>}
  */
-async function buildPackages(terminal, builds, verbose) {
+async function buildPackages(terminal, builds) {
   for (const item of builds) {
-    if (verbose) terminal.line(`npm info run ${item.name}@${item.version} install node_modules/${item.name} node install.js`);
+    terminal.log("info", "run", `${item.name}@${item.version} install node_modules/${item.name} node install.js`);
     const duration = between(600, 1400);
-    if (terminal.interactive) terminal.status(`npm install building ${item.name}@${item.version}`);
     await sleep(duration);
-    if (verbose) terminal.line(`npm info run ${item.name}@${item.version} install { code: 0, signal: null }`);
-    else if (!terminal.interactive) terminal.line(`npm install building ${item.name}@${item.version} done`);
+    terminal.log("info", "run", `${item.name}@${item.version} install { code: 0, signal: null }`);
   }
 }
 
 /**
- * Display reification progress without a final success line before the next batch.
- * @param {Terminal} terminal
- * @param {PackageEntry[]} entries
- * @param {boolean} verbose
+ * Wait for simulated reification without printing a final success line.
  * @returns {Promise<void>}
  */
-async function installBatch(terminal, entries, verbose) {
-  const duration = between(700, 1500);
-  const start = performance.now();
-  while (performance.now() - start < duration) {
-    const ratio = Math.min(1, (performance.now() - start) / duration);
-    terminal.status(`npm install reify ${Math.floor(ratio * entries.length)}/${entries.length} packages`);
-    await sleep(100);
-  }
-  terminal.clear();
-  if (verbose) terminal.line(`npm sill reify completed ${entries.length} package nodes`);
-  else if (!terminal.interactive) terminal.line(`npm install reify ${entries.length} packages`);
-  // Deliberately no "added N packages" or audit summary: another batch follows.
+async function installBatch() {
+  // Reification takes time but npm prints its summary only once it finishes.
+  // A new batch follows, so neither a success line nor a fabricated log is emitted.
+  await sleep(between(700, 1500));
 }
 
 /**
@@ -387,11 +396,11 @@ async function installBatch(terminal, entries, verbose) {
  * @returns {Promise<never>} Runs until interrupted or an error occurs.
  */
 async function runForever(args, terminal) {
-  if (args.verbose) {
-    terminal.line(`npm verbose cli node ${args.node.text} npm ${args.npm.text}`);
-    terminal.line("npm info using npm@" + args.npm.text);
-    terminal.line("npm info using node@v" + args.node.text);
-  }
+  terminal.log("verbose", "cli", `node@v${args.node.text} npm@${args.npm.text}`);
+  terminal.log("info", "using", `npm@${args.npm.text}`);
+  terminal.log("info", "using", `node@v${args.node.text}`);
+  terminal.log("verbose", "title", "npm install");
+  terminal.log("verbose", "argv", `"install" "--loglevel" "${args.loglevel}"`);
   const network = new NetworkState(); // Shared across all packages and batches.
   const catalog = new Map(); // Reuse each fictional package's definition for this run.
   let roots = [];
@@ -410,12 +419,10 @@ async function runForever(args, terminal) {
     for (const item of virtualPackages(Math.floor(between(1, 5)), catalog, [...known])) {
       entries.splice(Math.floor(between(0, entries.length + 1)), 0, { package: item, parent: "" });
     }
-    if (args.verbose) terminal.line("npm sill idealTree buildDeps");
-    else if (!terminal.interactive) terminal.line("npm install resolving dependencies...");
     const builds = [];
-    for (const entry of entries) await collectPackage(terminal, entry, network, args.verbose, builds);
-    await buildPackages(terminal, builds, args.verbose);
-    await installBatch(terminal, entries, args.verbose);
+    for (const entry of entries) await collectPackage(terminal, entry, network, builds);
+    await buildPackages(terminal, builds);
+    await installBatch();
   }
 }
 
@@ -430,23 +437,25 @@ function main() {
     return;
   }
   if (args.help) {
-    console.log("Usage: node install.js [--node VERSION] [--npm VERSION] [--verbose]\n" +
+    console.log("Usage: node install.js [--node VERSION] [--npm VERSION] [--loglevel LEVEL]\n" +
+      "Log levels: notice (default), http, info, verbose.\n" +
       "Simulate an endless npm install; versions default to the installed Node.js and npm.\n" +
       "Press Ctrl+C to stop. No packages are installed.");
     return;
   }
 
-  const terminal = new Terminal();
+  const terminal = new Terminal(args.loglevel);
   const stop = (signal) => {
-    terminal.clear();
-    terminal.line(terminal.paint(`npm error process terminated (${signal})`, "31"));
+    terminal.stop();
+    terminal.log("error", "", `process terminated (${signal})`);
     process.exit(signal === "SIGINT" ? 130 : 143);
   };
   process.on("SIGINT", () => stop("SIGINT"));
   process.on("SIGTERM", () => stop("SIGTERM"));
+  terminal.start();
   runForever(args, terminal).catch((error) => {
-    terminal.clear();
-    console.error(`npm error ${error.message}`);
+    terminal.stop();
+    terminal.log("error", "", error.message);
     process.exitCode = 1;
   });
 }
